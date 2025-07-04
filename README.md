@@ -1,6 +1,6 @@
 # cast-studio
 
-AI generated web casting studio software.
+AI generated webcasting studio software.
 
 ## Usage
 
