@@ -2,7 +2,7 @@
 
 AI generated webcasting studio software for Windows.
 
-Vibe coded, only AI generated code, with Claude 4.0.
+Vibe coded, only AI generated code, with Claude 4.0. Debugging with Gemini 2.5 Flash which involved rewrites.
 
 ## Purpose
 

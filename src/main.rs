@@ -1,5 +1,5 @@
 use opencv::{
-    core::{Mat, Point, Scalar, Size, CV_8UC3, AlgorithmHint},
+    core::{Mat, Point, Scalar, Size, CV_8UC3},
     highgui::{self, WINDOW_AUTOSIZE},
     imgcodecs,
     imgproc::{self, COLOR_BGR2HSV, FONT_HERSHEY_SIMPLEX},
@@ -211,7 +211,7 @@ impl GreenScreenApp {
     fn remove_green_screen(&self, frame: &Mat) -> Result<Mat, Box<dyn std::error::Error>> {
         // Convert to HSV color space
         let mut hsv = Mat::default();
-        imgproc::cvt_color(frame, &mut hsv, COLOR_BGR2HSV, 0, AlgorithmHint::default())?;
+        imgproc::cvt_color(frame, &mut hsv, COLOR_BGR2HSV, 0, Default::default())?;
 
         // Create mask for green screen
         let lower_green = Scalar::new(
@@ -264,7 +264,7 @@ impl GreenScreenApp {
             0.0,
             0.0,
             opencv::core::BORDER_DEFAULT,
-            AlgorithmHint::default(),
+            Default::default(),
         )?;
 
         Ok(blurred_mask)
@@ -342,25 +342,34 @@ impl GreenScreenApp {
                     OverlayType::Image | OverlayType::Logo => {
                         if let Some(ref overlay_img) = data.image {
                             // Create ROI for overlay
-                            let roi = opencv::core::Rect::new(
+                            let roi_rect = opencv::core::Rect::new(
                                 overlay_config.position.x,
                                 overlay_config.position.y,
                                 overlay_config.size.width.min(frame.cols() - overlay_config.position.x),
                                 overlay_config.size.height.min(frame.rows() - overlay_config.position.y),
                             );
 
-                            if roi.width > 0 && roi.height > 0 {
-                                let mut roi_frame = Mat::roi(frame, roi)?;
-                                let mut resized_overlay = Mat::default();
-                                imgproc::resize(
-                                    overlay_img,
-                                    &mut resized_overlay,
-                                    Size::new(roi.width, roi.height),
-                                    0.0,
-                                    0.0,
-                                    imgproc::INTER_LINEAR,
-                                )?;
-                                resized_overlay.copy_to(&mut roi_frame.try_deref_mut()?)?;
+                            if roi_rect.width > 0 && roi_rect.height > 0 {
+                                // Get a mutable ROI as a BoxedRef
+                                let mut roi_boxed_ref = frame.roi(roi_rect)?;
+
+                                // Try to get a mutable Mat reference from the BoxedRef using `as_mut()`
+                                // This method is common for getting mutable references from smart pointers.
+                                if let Some(dst_mat) = roi_boxed_ref.as_mut() {
+                                    let mut resized_overlay = Mat::default();
+                                    imgproc::resize(
+                                        overlay_img,
+                                        &mut resized_overlay,
+                                        Size::new(roi_rect.width, roi_rect.height),
+                                        0.0,
+                                        0.0,
+                                        imgproc::INTER_LINEAR,
+                                    )?;
+                                    resized_overlay.copy_to(dst_mat)?;
+                                } else {
+                                    // Handle the case where as_mut() returns None (e.g., if the ROI is not writable)
+                                    eprintln!("Warning: Could not get mutable Mat from ROI BoxedRef for overlay.");
+                                }
                             }
                         }
                     }
@@ -396,7 +405,7 @@ impl GreenScreenApp {
 
         // Convert single channel mask to 3-channel
         let mut mask_3ch = Mat::default();
-        imgproc::cvt_color(mask, &mut mask_3ch, imgproc::COLOR_GRAY2BGR, 0, AlgorithmHint::default())?;
+        imgproc::cvt_color(mask, &mut mask_3ch, imgproc::COLOR_GRAY2BGR, 0, Default::default())?;
 
         // Normalize mask to 0-1 range
         let mut mask_normalized = Mat::default();
