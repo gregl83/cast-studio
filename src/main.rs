@@ -1,8 +1,8 @@
 use opencv::{
-    core::{Mat, Point, Scalar, Size, Vec3b, CV_8UC3},
+    core::{Mat, Point, Scalar, Size, CV_8UC3, AlgorithmHint},
     highgui::{self, WINDOW_AUTOSIZE},
     imgcodecs,
-    imgproc::{self, COLOR_BGR2HSV, COLOR_HSV2BGR, FONT_HERSHEY_SIMPLEX},
+    imgproc::{self, COLOR_BGR2HSV, FONT_HERSHEY_SIMPLEX},
     prelude::*,
     videoio::{self, VideoCapture, CAP_ANY},
 };
@@ -11,7 +11,6 @@ use std::{
     fs,
     path::Path,
     sync::{Arc, Mutex},
-    thread,
     time::{Duration, Instant},
 };
 use serde::{Deserialize, Serialize};
@@ -48,7 +47,7 @@ struct GreenScreenConfig {
     morphology_kernel_size: i32,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 struct OverlayConfig {
     id: String,
     overlay_type: OverlayType,
@@ -61,7 +60,7 @@ struct OverlayConfig {
     thickness: i32,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 enum OverlayType {
     Text,
     Image,
@@ -69,13 +68,13 @@ enum OverlayType {
     Logo,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 struct Position {
     x: i32,
     y: i32,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 struct Size2D {
     width: i32,
     height: i32,
@@ -186,7 +185,7 @@ impl GreenScreenApp {
 
         // Initialize virtual camera writer
         let fourcc = opencv::videoio::VideoWriter::fourcc(
-            b'M', b'J', b'P', b'G'
+            'M', 'J', 'P', 'G'
         )?;
 
         let virtual_camera_writer = opencv::videoio::VideoWriter::new(
@@ -212,7 +211,7 @@ impl GreenScreenApp {
     fn remove_green_screen(&self, frame: &Mat) -> Result<Mat, Box<dyn std::error::Error>> {
         // Convert to HSV color space
         let mut hsv = Mat::default();
-        imgproc::cvt_color(frame, &mut hsv, COLOR_BGR2HSV, 0)?;
+        imgproc::cvt_color(frame, &mut hsv, COLOR_BGR2HSV, 0, AlgorithmHint::default())?;
 
         // Create mask for green screen
         let lower_green = Scalar::new(
@@ -265,6 +264,7 @@ impl GreenScreenApp {
             0.0,
             0.0,
             opencv::core::BORDER_DEFAULT,
+            AlgorithmHint::default(),
         )?;
 
         Ok(blurred_mask)
@@ -360,7 +360,7 @@ impl GreenScreenApp {
                                     0.0,
                                     imgproc::INTER_LINEAR,
                                 )?;
-                                resized_overlay.copy_to(&mut roi_frame)?;
+                                resized_overlay.copy_to(&mut roi_frame.try_deref_mut()?)?;
                             }
                         }
                     }
@@ -396,7 +396,7 @@ impl GreenScreenApp {
 
         // Convert single channel mask to 3-channel
         let mut mask_3ch = Mat::default();
-        imgproc::cvt_color(mask, &mut mask_3ch, imgproc::COLOR_GRAY2BGR, 0)?;
+        imgproc::cvt_color(mask, &mut mask_3ch, imgproc::COLOR_GRAY2BGR, 0, AlgorithmHint::default())?;
 
         // Normalize mask to 0-1 range
         let mut mask_normalized = Mat::default();
@@ -483,61 +483,72 @@ impl GreenScreenApp {
     }
 
     fn start_overlay_threads(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let rt = tokio::runtime::Runtime::new()?;
+        let overlay_data = Arc::clone(&self.overlay_data);
+        let overlays = self.config.overlays.clone();
 
-        for overlay_config in &self.config.overlays {
-            let overlay_data = Arc::clone(&self.overlay_data);
-            let config = overlay_config.clone();
+        tokio::spawn(async move {
+            let mut interval = interval(Duration::from_millis(100));
 
-            rt.spawn(async move {
-                let mut interval = interval(Duration::from_millis(config.update_interval_ms));
+            loop {
+                interval.tick().await;
 
-                loop {
-                    interval.tick().await;
-
-                    let content = match config.overlay_type {
-                        OverlayType::Text => {
-                            match config.content.as_str() {
-                                "Current Time" => {
-                                    chrono::Local::now().format("%H:%M:%S").to_string()
-                                }
-                                _ => config.content.clone(),
+                for overlay_config in &overlays {
+                    // Check if it's time to update this overlay
+                    let should_update = {
+                        let data = overlay_data.lock().unwrap();
+                        match data.get(&overlay_config.id) {
+                            Some(overlay) => {
+                                overlay.last_update.elapsed().as_millis() >= overlay_config.update_interval_ms as u128
                             }
-                        }
-                        OverlayType::WebData => {
-                            // Fetch data from web API
-                            match reqwest::get(&config.content).await {
-                                Ok(response) => {
-                                    response.text().await.unwrap_or_else(|_| "Error".to_string())
-                                }
-                                Err(_) => "Network Error".to_string(),
-                            }
-                        }
-                        OverlayType::Image | OverlayType::Logo => {
-                            // Load image
-                            config.content.clone()
+                            None => true,
                         }
                     };
 
-                    let image = match config.overlay_type {
-                        OverlayType::Image | OverlayType::Logo => {
-                            imgcodecs::imread(&config.content, imgcodecs::IMREAD_COLOR).ok()
-                        }
-                        _ => None,
-                    };
+                    if should_update {
+                        let content = match overlay_config.overlay_type {
+                            OverlayType::Text => {
+                                match overlay_config.content.as_str() {
+                                    "Current Time" => {
+                                        chrono::Local::now().format("%H:%M:%S").to_string()
+                                    }
+                                    _ => overlay_config.content.clone(),
+                                }
+                            }
+                            OverlayType::WebData => {
+                                // Fetch data from web API
+                                match reqwest::get(&overlay_config.content).await {
+                                    Ok(response) => {
+                                        response.text().await.unwrap_or_else(|_| "Error".to_string())
+                                    }
+                                    Err(_) => "Network Error".to_string(),
+                                }
+                            }
+                            OverlayType::Image | OverlayType::Logo => {
+                                // Load image
+                                overlay_config.content.clone()
+                            }
+                        };
 
-                    let mut data = overlay_data.lock().unwrap();
-                    data.insert(
-                        config.id.clone(),
-                        OverlayData {
-                            content,
-                            image,
-                            last_update: Instant::now(),
-                        },
-                    );
+                        let image = match overlay_config.overlay_type {
+                            OverlayType::Image | OverlayType::Logo => {
+                                imgcodecs::imread(&overlay_config.content, imgcodecs::IMREAD_COLOR).ok()
+                            }
+                            _ => None,
+                        };
+
+                        let mut data = overlay_data.lock().unwrap();
+                        data.insert(
+                            overlay_config.id.clone(),
+                            OverlayData {
+                                content,
+                                image,
+                                last_update: Instant::now(),
+                            },
+                        );
+                    }
                 }
-            });
-        }
+            }
+        });
 
         Ok(())
     }

@@ -1,0 +1,57 @@
+{
+  "webcam_index": 0,
+  "output_width": 1280,
+  "output_height": 720,
+  "background_type": "Image",
+  "background_path": "background.jpg",
+  "green_screen": {
+    "hue_min": 35,
+    "hue_max": 85,
+    "saturation_min": 50,
+    "saturation_max": 255,
+    "value_min": 50,
+    "value_max": 255,
+    "blur_kernel_size": 5,
+    "morphology_kernel_size": 3
+  },
+  "overlays": [
+    {
+      "id": "time",
+      "overlay_type": "Text",
+      "position": { "x": 50, "y": 50 },
+      "size": { "width": 200, "height": 50 },
+      "content": "Current Time",
+      "update_interval_ms": 1000,
+      "font_scale": 1.0,
+      "color": [255, 255, 255],
+      "thickness": 2
+    },
+    {
+      "id": "logo",
+      "overlay_type": "Logo",
+      "position": { "x": 1100, "y": 50 },
+      "size": { "width": 120, "height": 60 },
+      "content": "logo.png",
+      "update_interval_ms": 5000,
+      "font_scale": 1.0,
+      "color": [255, 255, 255],
+      "thickness": 2
+    },
+    {
+      "id": "weather",
+      "overlay_type": "WebData",
+      "position": { "x": 50, "y": 100 },
+      "size": { "width": 300, "height": 30 },
+      "content": "https://api.openweathermap.org/data/2.5/weather?q=London&appid=YOUR_API_KEY",
+      "update_interval_ms": 300000,
+      "font_scale": 0.8,
+      "color": [255, 255, 0],
+      "thickness": 2
+    }
+  ],
+  "virtual_camera": {
+    "device_name": "/dev/video2",
+    "fps": 30.0,
+    "format": "MJPG"
+  }
+}
