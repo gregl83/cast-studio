@@ -76,6 +76,46 @@ struct GreenScreenConfig {
     morphology_kernel_size: i32,
 }
 
+
+// New structure for quality analysis
+#[derive(Debug)]
+struct GreenScreenQuality {
+    uniformity: f64,
+    lighting_quality: f64,
+    overall_quality: f64,
+}
+
+// IMPROVEMENT 7: Enhanced configuration with adaptive parameters
+#[derive(Debug, Serialize, Deserialize)]
+struct EnhancedGreenScreenConfig {
+    // Primary green detection
+    hue_min: i32,
+    hue_max: i32,
+    saturation_min: i32,
+    saturation_max: i32,
+    value_min: i32,
+    value_max: i32,
+
+    // Secondary detection parameters
+    lab_a_threshold: f64,
+    edge_protection_enabled: bool,
+    adaptive_threshold_enabled: bool,
+
+    // Morphological operations
+    blur_kernel_size: i32,
+    morphology_kernel_size: i32,
+    noise_removal_iterations: i32,
+    hole_filling_iterations: i32,
+
+    // Blending parameters
+    edge_softening_radius: f64,
+    gamma_correction: f64,
+
+    // Quality thresholds
+    min_quality_threshold: f64,
+    auto_adjust_parameters: bool,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct OverlayConfig {
     id: String,
@@ -295,7 +335,7 @@ impl GreenScreenApp {
         let mut hsv = Mat::default();
         imgproc::cvt_color(frame, &mut hsv, COLOR_BGR2HSV, 0, get_default_algorithm_hint().unwrap())?;
 
-        // Create mask for green screen
+        // Create initial mask for green screen
         let lower_green = Scalar::new(
             self.config.green_screen.hue_min as f64,
             self.config.green_screen.saturation_min as f64,
@@ -312,8 +352,55 @@ impl GreenScreenApp {
         let mut mask = Mat::default();
         opencv::core::in_range(&hsv, &lower_green, &upper_green, &mut mask)?;
 
-        // Apply morphological operations to clean up the mask
-        let kernel = imgproc::get_structuring_element(
+        // IMPROVEMENT 1: Additional color space detection
+        // Convert to LAB color space for better color separation
+        let mut lab = Mat::default();
+        imgproc::cvt_color(frame, &mut lab, imgproc::COLOR_BGR2Lab, 0, get_default_algorithm_hint().unwrap())?;
+
+        // Create LAB-based mask (green in LAB space typically has negative A channel)
+        let mut lab_mask = Mat::default();
+        let mut lab_channels = opencv::core::Vector::<Mat>::new();
+        opencv::core::split(&lab, &mut lab_channels)?;
+
+        // Green pixels typically have A channel < 127 (negative in LAB)
+        let a_channel = lab_channels.get(1)?;
+        opencv::core::compare(&a_channel, &Scalar::all(115.0), &mut lab_mask, opencv::core::CMP_LT)?;
+
+        // Combine HSV and LAB masks
+        let mut combined_mask = Mat::default();
+        opencv::core::bitwise_or(&mask, &lab_mask, &mut combined_mask, &opencv::core::no_array())?;
+
+        // IMPROVEMENT 2: Edge detection to preserve subject boundaries
+        let mut gray = Mat::default();
+        imgproc::cvt_color(frame, &mut gray, imgproc::COLOR_BGR2GRAY, 0, get_default_algorithm_hint().unwrap())?;
+
+        let mut edges = Mat::default();
+        imgproc::canny(&gray, &mut edges, 50.0, 150.0, 3, false)?;
+
+        // Dilate edges to create boundary protection
+        let edge_kernel = imgproc::get_structuring_element(
+            imgproc::MORPH_ELLIPSE,
+            Size::new(3, 3),
+            Point::new(-1, -1),
+        )?;
+
+        let mut dilated_edges = Mat::default();
+        imgproc::dilate(&edges, &mut dilated_edges, &edge_kernel, Point::new(-1, -1), 1,
+                        opencv::core::BORDER_CONSTANT, imgproc::morphology_default_border_value()?)?;
+
+        // Remove green screen areas that are too close to edges (likely subject boundaries)
+        let mut protected_mask = Mat::default();
+        opencv::core::bitwise_and(&combined_mask, &dilated_edges, &mut protected_mask, &opencv::core::no_array())?;
+        opencv::core::subtract(&mut combined_mask.clone(), &protected_mask, &mut combined_mask, &opencv::core::no_array(), -1)?;
+
+        // IMPROVEMENT 3: Multi-stage morphological operations
+        let small_kernel = imgproc::get_structuring_element(
+            imgproc::MORPH_ELLIPSE,
+            Size::new(3, 3),
+            Point::new(-1, -1),
+        )?;
+
+        let large_kernel = imgproc::get_structuring_element(
             imgproc::MORPH_ELLIPSE,
             Size::new(
                 self.config.green_screen.morphology_kernel_size,
@@ -322,34 +409,56 @@ impl GreenScreenApp {
             Point::new(-1, -1),
         )?;
 
+        // Remove small noise
         let mut cleaned_mask = Mat::default();
         imgproc::morphology_ex(
-            &mask,
+            &combined_mask,
             &mut cleaned_mask,
-            imgproc::MORPH_CLOSE,
-            &kernel,
+            imgproc::MORPH_OPEN,
+            &small_kernel,
             Point::new(-1, -1),
-            1,
+            2,
             opencv::core::BORDER_CONSTANT,
             imgproc::morphology_default_border_value()?,
         )?;
 
-        // Apply Gaussian blur to soften edges
-        let mut blurred_mask = Mat::default();
-        imgproc::gaussian_blur(
+        // Fill holes in green screen areas
+        let mut filled_mask = Mat::default();
+        imgproc::morphology_ex(
             &cleaned_mask,
-            &mut blurred_mask,
+            &mut filled_mask,
+            imgproc::MORPH_CLOSE,
+            &large_kernel,
+            Point::new(-1, -1),
+            2,
+            opencv::core::BORDER_CONSTANT,
+            imgproc::morphology_default_border_value()?,
+        )?;
+
+        // IMPROVEMENT 4: Gradient-based edge softening
+        let mut distance_transform = Mat::default();
+        imgproc::distance_transform(&filled_mask, &mut distance_transform, imgproc::DIST_L2, 3, opencv::core::CV_32F)?;
+
+        // Create gradient mask for smooth transitions
+        let mut gradient_mask = Mat::default();
+        opencv::core::normalize(&distance_transform, &mut gradient_mask, 0.0, 255.0, opencv::core::NORM_MINMAX, opencv::core::CV_8U, &opencv::core::no_array())?;
+
+        // Apply Gaussian blur for final smoothing
+        let mut final_mask = Mat::default();
+        imgproc::gaussian_blur(
+            &gradient_mask,
+            &mut final_mask,
             Size::new(
                 self.config.green_screen.blur_kernel_size,
                 self.config.green_screen.blur_kernel_size,
             ),
-            0.0,
-            0.0,
+            2.0,
+            2.0,
             opencv::core::BORDER_DEFAULT,
             get_default_algorithm_hint().unwrap(),
         )?;
 
-        Ok(blurred_mask)
+        Ok(final_mask)
     }
 
     fn update_background_frame(&mut self) -> Result<(), Box<dyn std::error::Error>> {
@@ -482,25 +591,29 @@ impl GreenScreenApp {
         let mut mask_3ch = Mat::default();
         imgproc::cvt_color(mask, &mut mask_3ch, imgproc::COLOR_GRAY2BGR, 0, get_default_algorithm_hint().unwrap())?;
 
-        // Normalize mask to 0-1 range
+        // Normalize mask to 0-1 range for smooth blending
         let mut mask_normalized = Mat::default();
         mask_3ch.convert_to(&mut mask_normalized, opencv::core::CV_32F, 1.0/255.0, 0.0)?;
 
-        // Convert frames to float for blending
+        // Apply gamma correction to mask for better blending
+        let mut gamma_corrected_mask = Mat::default();
+        opencv::core::pow(&mask_normalized, 0.8, &mut gamma_corrected_mask)?;
+
+        // Convert frames to float for precise blending
         let mut webcam_float = Mat::default();
         let mut background_float = Mat::default();
         webcam_frame.convert_to(&mut webcam_float, opencv::core::CV_32F, 1.0, 0.0)?;
         self.current_background_frame.convert_to(&mut background_float, opencv::core::CV_32F, 1.0, 0.0)?;
 
-        // Create inverse mask
+        // Create smooth inverse mask
         let mut inv_mask = Mat::default();
-        opencv::core::subtract(&Scalar::all(1.0), &mask_normalized, &mut inv_mask, &opencv::core::no_array(), -1)?;
+        opencv::core::subtract(&Scalar::all(1.0), &gamma_corrected_mask, &mut inv_mask, &opencv::core::no_array(), -1)?;
 
-        // Blend: result = webcam * (1 - mask) + background * mask
+        // Blend with anti-aliasing: result = webcam * (1 - mask) + background * mask
         let mut webcam_masked = Mat::default();
         let mut background_masked = Mat::default();
         opencv::core::multiply(&webcam_float, &inv_mask, &mut webcam_masked, 1.0, -1)?;
-        opencv::core::multiply(&background_float, &mask_normalized, &mut background_masked, 1.0, -1)?;
+        opencv::core::multiply(&background_float, &gamma_corrected_mask, &mut background_masked, 1.0, -1)?;
 
         let mut result_float = Mat::default();
         opencv::core::add(&webcam_masked, &background_masked, &mut result_float, &opencv::core::no_array(), -1)?;
@@ -509,6 +622,52 @@ impl GreenScreenApp {
         result_float.convert_to(&mut result, opencv::core::CV_8U, 1.0, 0.0)?;
 
         Ok(result)
+    }
+
+    fn analyze_green_screen_quality(&self, frame: &Mat) -> Result<GreenScreenQuality, Box<dyn std::error::Error>> {
+        let mut hsv = Mat::default();
+        imgproc::cvt_color(frame, &mut hsv, COLOR_BGR2HSV, 0, get_default_algorithm_hint().unwrap())?;
+
+        // Split HSV channels
+        let mut hsv_channels = opencv::core::Vector::<Mat>::new();
+        opencv::core::split(&hsv, &mut hsv_channels)?;
+
+        let hue_channel = hsv_channels.get(0)?;
+        let sat_channel = hsv_channels.get(1)?;
+
+        // Analyze green screen uniformity
+        let mut green_region = Mat::default();
+        let lower_green = Scalar::new(35.0, 50.0, 50.0, 0.0);
+        let upper_green = Scalar::new(85.0, 255.0, 255.0, 0.0);
+        opencv::core::in_range(&hsv, &lower_green, &upper_green, &mut green_region)?;
+
+        // Calculate statistics
+        let mut mean = Scalar::default();
+        let mut stddev = Scalar::default();
+        opencv::core::mean_std_dev(&hue_channel, &mut mean, &mut stddev, &green_region)?;
+
+        let uniformity = 1.0 - (stddev[0] / 180.0); // Normalize hue std dev
+
+        // Check lighting conditions
+        let mut gray = Mat::default();
+        imgproc::cvt_color(frame, &mut gray, imgproc::COLOR_BGR2GRAY, 0, get_default_algorithm_hint().unwrap())?;
+
+        let mut lighting_mean = Scalar::default();
+        opencv::core::mean_std_dev(&gray, &mut lighting_mean, &mut stddev, &green_region)?;
+
+        let lighting_quality = if lighting_mean[0] < 100.0 {
+            0.5 // Too dark
+        } else if lighting_mean[0] > 200.0 {
+            0.7 // Too bright
+        } else {
+            1.0 // Good lighting
+        };
+
+        Ok(GreenScreenQuality {
+            uniformity,
+            lighting_quality,
+            overall_quality: (uniformity + lighting_quality) / 2.0,
+        })
     }
 
     fn run(&mut self) -> Result<(), Box<dyn std::error::Error>> {

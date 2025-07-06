@@ -7,12 +7,21 @@
   "green_screen": {
     "hue_min": 35,
     "hue_max": 85,
-    "saturation_min": 50,
+    "saturation_min": 40,
     "saturation_max": 255,
-    "value_min": 50,
+    "value_min": 40,
     "value_max": 255,
-    "blur_kernel_size": 5,
-    "morphology_kernel_size": 3
+    "lab_a_threshold": 115,
+    "edge_protection_enabled": true,
+    "adaptive_threshold_enabled": true,
+    "blur_kernel_size": 7,
+    "morphology_kernel_size": 5,
+    "noise_removal_iterations": 2,
+    "hole_filling_iterations": 2,
+    "edge_softening_radius": 2.0,
+    "gamma_correction": 0.8,
+    "min_quality_threshold": 0.7,
+    "auto_adjust_parameters": true
   },
   "overlays": [
     {
