@@ -1,5 +1,9 @@
+// Add to your Cargo.toml dependencies:
+// clap = { version = "4.0", features = ["derive"] }
+
+use clap::Parser;
 use opencv::{
-    core::{Mat, Point, Scalar, Size, CV_8UC3},
+    core::{Mat, Point, Scalar, Size, CV_8UC3, get_default_algorithm_hint},
     highgui::{self, WINDOW_AUTOSIZE},
     imgcodecs,
     imgproc::{self, COLOR_BGR2HSV, FONT_HERSHEY_SIMPLEX},
@@ -9,12 +13,37 @@ use opencv::{
 use std::{
     collections::HashMap,
     fs,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 use serde::{Deserialize, Serialize};
 use tokio::time::interval;
+
+// CLI Arguments structure
+#[derive(Parser)]
+#[command(author, version, about, long_about = None)]
+struct Args {
+    /// Path to the configuration file
+    #[arg(short, long, default_value = "config.json")]
+    config: PathBuf,
+
+    /// Path to the background image/video (overrides config file)
+    #[arg(short, long)]
+    background: Option<PathBuf>,
+
+    /// Webcam index (overrides config file)
+    #[arg(short, long)]
+    webcam: Option<i32>,
+
+    /// Output width (overrides config file)
+    #[arg(long)]
+    width: Option<i32>,
+
+    /// Output height (overrides config file)
+    #[arg(long)]
+    height: Option<i32>,
+}
 
 // Configuration structure
 #[derive(Debug, Serialize, Deserialize)]
@@ -109,6 +138,12 @@ struct GreenScreenApp {
 
 impl Default for Config {
     fn default() -> Self {
+        let virtual_camera_device = if cfg!(target_os = "windows") {
+            "virtual_camera".to_string() // Placeholder for Windows
+        } else {
+            "/dev/video2".to_string() // Linux v4l2loopback device
+        };
+
         Config {
             webcam_index: 0,
             output_width: 1280,
@@ -139,10 +174,46 @@ impl Default for Config {
                 },
             ],
             virtual_camera: VirtualCameraConfig {
-                device_name: "/dev/video2".to_string(),
+                device_name: virtual_camera_device,
                 fps: 30.0,
                 format: "MJPG".to_string(),
             },
+        }
+    }
+}
+
+impl Config {
+    // Apply command line argument overrides
+    fn apply_args(&mut self, args: &Args) {
+        if let Some(background) = &args.background {
+            self.background_path = background.to_string_lossy().to_string();
+            // Auto-detect background type from extension
+            if let Some(ext) = background.extension().and_then(|e| e.to_str()) {
+                match ext.to_lowercase().as_str() {
+                    "jpg" | "jpeg" | "png" | "bmp" | "tiff" => {
+                        self.background_type = BackgroundType::Image;
+                    }
+                    "mp4" | "avi" | "mov" | "mkv" | "webm" => {
+                        self.background_type = BackgroundType::Video;
+                    }
+                    _ => {
+                        println!("Warning: Unknown background file extension, assuming image");
+                        self.background_type = BackgroundType::Image;
+                    }
+                }
+            }
+        }
+
+        if let Some(webcam) = args.webcam {
+            self.webcam_index = webcam;
+        }
+
+        if let Some(width) = args.width {
+            self.output_width = width;
+        }
+
+        if let Some(height) = args.height {
+            self.output_height = height;
         }
     }
 }
@@ -159,6 +230,9 @@ impl GreenScreenApp {
         let (background_image, background_video) = match config.background_type {
             BackgroundType::Image => {
                 let img = imgcodecs::imread(&config.background_path, imgcodecs::IMREAD_COLOR)?;
+                if img.empty() {
+                    return Err(format!("Failed to load background image: {}", config.background_path).into());
+                }
                 let mut resized = Mat::default();
                 imgproc::resize(
                     &img,
@@ -172,6 +246,9 @@ impl GreenScreenApp {
             }
             BackgroundType::Video => {
                 let video = VideoCapture::from_file(&config.background_path, CAP_ANY)?;
+                if !video.is_opened()? {
+                    return Err(format!("Failed to open background video: {}", config.background_path).into());
+                }
                 (None, Some(video))
             }
         };
@@ -183,18 +260,23 @@ impl GreenScreenApp {
         )?
             .to_mat()?;
 
-        // Initialize virtual camera writer
-        let fourcc = opencv::videoio::VideoWriter::fourcc(
-            'M', 'J', 'P', 'G'
-        )?;
+        // Initialize virtual camera writer (skip on Windows for now)
+        let virtual_camera_writer = if cfg!(target_os = "windows") {
+            println!("Virtual camera output disabled on Windows (requires OBS Virtual Camera or similar)");
+            None
+        } else {
+            let fourcc = opencv::videoio::VideoWriter::fourcc(
+                'M', 'J', 'P', 'G'
+            )?;
 
-        let virtual_camera_writer = opencv::videoio::VideoWriter::new(
-            &config.virtual_camera.device_name,
-            fourcc,
-            config.virtual_camera.fps,
-            Size::new(config.output_width, config.output_height),
-            true,
-        ).ok();
+            opencv::videoio::VideoWriter::new(
+                &config.virtual_camera.device_name,
+                fourcc,
+                config.virtual_camera.fps,
+                Size::new(config.output_width, config.output_height),
+                true,
+            ).ok()
+        };
 
         Ok(GreenScreenApp {
             config,
@@ -211,7 +293,7 @@ impl GreenScreenApp {
     fn remove_green_screen(&self, frame: &Mat) -> Result<Mat, Box<dyn std::error::Error>> {
         // Convert to HSV color space
         let mut hsv = Mat::default();
-        imgproc::cvt_color(frame, &mut hsv, COLOR_BGR2HSV, 0, Default::default())?;
+        imgproc::cvt_color(frame, &mut hsv, COLOR_BGR2HSV, 0, get_default_algorithm_hint().unwrap())?;
 
         // Create mask for green screen
         let lower_green = Scalar::new(
@@ -264,7 +346,7 @@ impl GreenScreenApp {
             0.0,
             0.0,
             opencv::core::BORDER_DEFAULT,
-            Default::default(),
+            get_default_algorithm_hint().unwrap(),
         )?;
 
         Ok(blurred_mask)
@@ -351,25 +433,18 @@ impl GreenScreenApp {
 
                             if roi_rect.width > 0 && roi_rect.height > 0 {
                                 // Get a mutable ROI as a BoxedRef
-                                let mut roi_boxed_ref = frame.roi(roi_rect)?;
+                                let mut roi_boxed_ref = frame.roi_mut(roi_rect)?;
 
-                                // Try to get a mutable Mat reference from the BoxedRef using `as_mut()`
-                                // This method is common for getting mutable references from smart pointers.
-                                if let Some(dst_mat) = roi_boxed_ref.as_mut() {
-                                    let mut resized_overlay = Mat::default();
-                                    imgproc::resize(
-                                        overlay_img,
-                                        &mut resized_overlay,
-                                        Size::new(roi_rect.width, roi_rect.height),
-                                        0.0,
-                                        0.0,
-                                        imgproc::INTER_LINEAR,
-                                    )?;
-                                    resized_overlay.copy_to(dst_mat)?;
-                                } else {
-                                    // Handle the case where as_mut() returns None (e.g., if the ROI is not writable)
-                                    eprintln!("Warning: Could not get mutable Mat from ROI BoxedRef for overlay.");
-                                }
+                                let mut resized_overlay = Mat::default();
+                                imgproc::resize(
+                                    overlay_img,
+                                    &mut resized_overlay,
+                                    Size::new(roi_rect.width, roi_rect.height),
+                                    0.0,
+                                    0.0,
+                                    imgproc::INTER_LINEAR,
+                                )?;
+                                resized_overlay.copy_to(&mut roi_boxed_ref)?;
                             }
                         }
                     }
@@ -405,7 +480,7 @@ impl GreenScreenApp {
 
         // Convert single channel mask to 3-channel
         let mut mask_3ch = Mat::default();
-        imgproc::cvt_color(mask, &mut mask_3ch, imgproc::COLOR_GRAY2BGR, 0, Default::default())?;
+        imgproc::cvt_color(mask, &mut mask_3ch, imgproc::COLOR_GRAY2BGR, 0, get_default_algorithm_hint().unwrap())?;
 
         // Normalize mask to 0-1 range
         let mut mask_normalized = Mat::default();
@@ -441,6 +516,9 @@ impl GreenScreenApp {
         self.start_overlay_threads()?;
 
         println!("Starting green screen application...");
+        println!("Background: {}", self.config.background_path);
+        println!("Webcam: {}", self.config.webcam_index);
+        println!("Resolution: {}x{}", self.config.output_width, self.config.output_height);
         println!("Press 'q' to quit, 's' to save current frame");
 
         let window_name = "Green Screen Virtual Webcam";
@@ -466,9 +544,11 @@ impl GreenScreenApp {
             // Apply overlays
             self.apply_overlays(&mut result)?;
 
-            // Write to virtual camera
+            // Write to virtual camera (skip on Windows)
             if let Some(ref mut writer) = self.virtual_camera_writer {
-                writer.write(&result)?;
+                if let Err(e) = writer.write(&result) {
+                    eprintln!("Warning: Failed to write to virtual camera: {}", e);
+                }
             }
 
             // Display result
@@ -565,18 +645,35 @@ impl GreenScreenApp {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let args = Args::parse();
+
     // Load or create configuration
-    let config_path = "config.json";
-    let config = if Path::new(config_path).exists() {
-        let config_str = fs::read_to_string(config_path)?;
+    let config_path = if args.config.is_dir() {
+        args.config.join("config.json")
+    } else {
+        args.config.clone()
+    };
+
+    let mut config = if config_path.exists() {
+        let config_str = fs::read_to_string(&config_path)?;
         serde_json::from_str(&config_str)?
     } else {
         let default_config = Config::default();
         let config_str = serde_json::to_string_pretty(&default_config)?;
-        fs::write(config_path, config_str)?;
-        println!("Created default config file: {}", config_path);
+        fs::write(&config_path, config_str)?;
+        println!("Created default config file: {}", config_path.display());
         default_config
     };
+
+    // Apply command line argument overrides
+    config.apply_args(&args);
+
+    // Validate that background file exists
+    if !Path::new(&config.background_path).exists() {
+        return Err(format!("Background file not found: {}", config.background_path).into());
+    }
+
+    println!("Using config file: {}", config_path.display());
 
     // Create and run the application
     let mut app = GreenScreenApp::new(config)?;
